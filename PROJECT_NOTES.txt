@@ -1,0 +1,8 @@
+Project: Next.js 15 Image Cleaner Free
+Framework: Next.js 15.5.24
+Processing: Browser-only OpenCV.js
+API key: None
+Server image upload: None
+OpenCV source at runtime: https://docs.opencv.org/4.13.0/opencv.js
+
+Usage note: only edit images you own or are authorized to modify.
