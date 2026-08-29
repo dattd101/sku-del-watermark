@@ -5,8 +5,8 @@ import "./globals.css";
 const GA_MEASUREMENT_ID = "G-8FMGRVQZY5";
 
 export const metadata: Metadata = {
-  title: "Image Cleaner - Free Local Inpainting",
-  description: "Chỉnh sửa vùng ảnh trực tiếp trong trình duyệt bằng OpenCV.js, không API key.",
+  title: "Image Cleaner - Free Browser Inpainting",
+  description: "Chỉnh sửa và phục hồi vùng ảnh trực tiếp trong trình duyệt, không API key và không upload ảnh lên server.",
   icons: {
     icon: [
       { url: "/favicon.ico", sizes: "any" },

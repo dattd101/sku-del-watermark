@@ -151,3 +151,24 @@ button:disabled { opacity: .4; cursor: not-allowed; }
   .themePicker button { min-width: 0; }
   .status { max-width: 100%; white-space: normal; }
 }
+
+.sessionBar {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: var(--panel-2);
+}
+.sessionBar > div { min-width: 0; }
+.sessionBar strong { display: block; margin-bottom: 4px; font-size: 13px; }
+.sessionBar span { display: block; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.sessionClear { flex: 0 0 auto; padding: 9px 12px; font-size: 12px; }
+
+@media (max-width: 620px) {
+  .sessionBar { align-items: flex-start; flex-direction: column; }
+  .sessionClear { width: 100%; }
+}

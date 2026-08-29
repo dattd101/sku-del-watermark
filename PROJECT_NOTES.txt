@@ -1,8 +1,10 @@
-Project: Next.js 15 Image Cleaner Free
-Framework: Next.js 15.5.24
-Processing: Browser-only OpenCV.js
-API key: None
-Server image upload: None
-OpenCV source at runtime: https://docs.opencv.org/4.13.0/opencv.js
-
-Usage note: only edit images you own or are authorized to modify.
+Image Cleaner v4
+- Next.js 15 client-side app
+- Max upload: 4 MB
+- Fixed upload preview race caused by resultCanvas ref
+- Removed OpenCV CDN runtime dependency
+- Local inpaint engine runs in /public/inpaint-worker.js Web Worker
+- Browser session auto-save/restore via sessionStorage
+- Light/Dark theme
+- Logo + favicon + GA G-8FMGRVQZY5
+- Vercel output: .next

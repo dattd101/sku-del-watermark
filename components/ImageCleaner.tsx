@@ -1,6 +1,5 @@
 "use client";
 
-import Script from "next/script";
 import {
   ChangeEvent,
   DragEvent,
@@ -25,10 +24,24 @@ type ImageMeta = {
   originalHeight: number;
 };
 
-const OPENCV_URL = "https://docs.opencv.org/4.13.0/opencv.js";
-const MAX_DIMENSION = 4096;
+type SessionMeta = {
+  version: 2;
+  image: ImageMeta;
+  brushSize: number;
+  radius: number;
+  mode: ToolMode;
+  algorithm: Algorithm;
+  hasResult: boolean;
+  updatedAt: number;
+};
+
+const MAX_DIMENSION = 2048;
 const MAX_FILE_MB = 4;
 const HISTORY_LIMIT = 12;
+const SESSION_META_KEY = "image-cleaner-session-meta-v2";
+const SESSION_IMAGE_KEY = "image-cleaner-session-image-v2";
+const SESSION_MASK_KEY = "image-cleaner-session-mask-v2";
+const SESSION_RESULT_KEY = "image-cleaner-session-result-v2";
 
 function fitInside(width: number, height: number, maxDimension: number) {
   const largest = Math.max(width, height);
@@ -40,6 +53,19 @@ function fitInside(width: number, height: number, maxDimension: number) {
   };
 }
 
+function loadImageSource(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Không đọc được dữ liệu ảnh."));
+    image.src = src;
+  });
+}
+
+function nextFrame() {
+  return new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+}
+
 export default function ImageCleaner() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const originalCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -47,13 +73,12 @@ export default function ImageCleaner() {
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
   const displayCanvasRef = useRef<HTMLCanvasElement>(null);
   const resultCanvasRef = useRef<HTMLCanvasElement>(null);
+  const workerRef = useRef<Worker | null>(null);
 
   const drawingRef = useRef(false);
   const lastPointRef = useRef<Point | null>(null);
   const historyRef = useRef<ImageData[]>([]);
 
-  const [cvReady, setCvReady] = useState(false);
-  const [cvError, setCvError] = useState(false);
   const [imageMeta, setImageMeta] = useState<ImageMeta | null>(null);
   const [brushSize, setBrushSize] = useState(42);
   const [radius, setRadius] = useState(3);
@@ -65,14 +90,42 @@ export default function ImageCleaner() {
   const [isDragging, setIsDragging] = useState(false);
   const [historyCount, setHistoryCount] = useState(0);
   const [theme, setTheme] = useState<Theme>("dark");
+  const [sessionStatus, setSessionStatus] = useState("Phiên cục bộ chưa có dữ liệu");
 
-  const canProcess = Boolean(cvReady && imageMeta && !processing);
+  const canProcess = Boolean(imageMeta && !processing);
 
-  const statusText = useMemo(() => {
-    if (cvError) return "Không tải được OpenCV.js";
-    if (!cvReady) return "Đang tải OpenCV.js...";
-    return "OpenCV.js đã sẵn sàng";
-  }, [cvError, cvReady]);
+  const statusText = useMemo(
+    () => (processing ? "Bộ xử lý local đang chạy" : "Bộ xử lý local đã sẵn sàng"),
+    [processing]
+  );
+
+  const safeSessionSet = useCallback((key: string, value: string) => {
+    try {
+      window.sessionStorage.setItem(key, value);
+      return true;
+    } catch (error) {
+      console.warn("Không thể lưu sessionStorage:", error);
+      return false;
+    }
+  }, []);
+
+  const saveMeta = useCallback(
+    (override?: Partial<Pick<SessionMeta, "hasResult">>) => {
+      if (!imageMeta) return;
+      const payload: SessionMeta = {
+        version: 2,
+        image: imageMeta,
+        brushSize,
+        radius,
+        mode,
+        algorithm,
+        hasResult: override?.hasResult ?? hasResult,
+        updatedAt: Date.now(),
+      };
+      safeSessionSet(SESSION_META_KEY, JSON.stringify(payload));
+    },
+    [algorithm, brushSize, hasResult, imageMeta, mode, radius, safeSessionSet]
+  );
 
   const refreshDisplay = useCallback(() => {
     const original = originalCanvasRef.current;
@@ -97,7 +150,6 @@ export default function ImageCleaner() {
     ctx.clearRect(0, 0, display.width, display.height);
     ctx.drawImage(original, 0, 0);
 
-    // Tô đỏ vùng mask bằng alpha của mask, không đọc toàn bộ pixel ở mỗi pointermove.
     overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
     overlayCtx.save();
     overlayCtx.fillStyle = "rgba(239, 68, 68, 0.45)";
@@ -108,6 +160,22 @@ export default function ImageCleaner() {
 
     ctx.drawImage(overlay, 0, 0);
   }, []);
+
+  const persistMask = useCallback(() => {
+    const mask = maskCanvasRef.current;
+    if (!mask?.width) return;
+    const ok = safeSessionSet(SESSION_MASK_KEY, mask.toDataURL("image/png"));
+    if (ok) setSessionStatus("Phiên cục bộ đã tự động lưu");
+    else setSessionStatus("Không đủ bộ nhớ để lưu toàn bộ phiên");
+  }, [safeSessionSet]);
+
+  const persistResult = useCallback(() => {
+    const result = resultCanvasRef.current;
+    if (!result?.width) return;
+    const ok = safeSessionSet(SESSION_RESULT_KEY, result.toDataURL("image/webp", 0.78));
+    if (ok) setSessionStatus("Ảnh, mask và kết quả đã lưu trong phiên");
+    else setSessionStatus("Kết quả vẫn dùng được nhưng phiên không đủ bộ nhớ");
+  }, [safeSessionSet]);
 
   const pushHistory = useCallback(() => {
     const mask = maskCanvasRef.current;
@@ -120,51 +188,89 @@ export default function ImageCleaner() {
   }, []);
 
   const initializeCanvas = useCallback(
-    (image: HTMLImageElement, fileName: string) => {
+    async (image: HTMLImageElement, fileName: string) => {
       const original = originalCanvasRef.current;
       const mask = maskCanvasRef.current;
-      const result = resultCanvasRef.current;
-      if (!original || !mask || !result) return;
+      if (!original || !mask) return;
+
+      workerRef.current?.terminate();
+      workerRef.current = null;
 
       const size = fitInside(image.naturalWidth, image.naturalHeight, MAX_DIMENSION);
       original.width = size.width;
       original.height = size.height;
       mask.width = size.width;
       mask.height = size.height;
-      result.width = size.width;
-      result.height = size.height;
 
       const originalCtx = original.getContext("2d", { willReadFrequently: true });
       const maskCtx = mask.getContext("2d", { willReadFrequently: true });
-      const resultCtx = result.getContext("2d");
-      if (!originalCtx || !maskCtx || !resultCtx) return;
+      if (!originalCtx || !maskCtx) return;
 
       originalCtx.clearRect(0, 0, size.width, size.height);
       originalCtx.drawImage(image, 0, 0, size.width, size.height);
-
-      // Mask trong suốt = không chọn; nét trắng = vùng cần inpaint.
       maskCtx.clearRect(0, 0, size.width, size.height);
-      resultCtx.clearRect(0, 0, size.width, size.height);
+
+      // resultCanvas có thể chưa tồn tại ở lần load đầu tiên; không được chặn preview vì lý do này.
+      const previousResult = resultCanvasRef.current;
+      if (previousResult) {
+        previousResult.width = size.width;
+        previousResult.height = size.height;
+        previousResult.getContext("2d")?.clearRect(0, 0, size.width, size.height);
+      }
 
       historyRef.current = [];
       setHistoryCount(0);
       setHasResult(false);
-      setImageMeta({
+
+      const meta: ImageMeta = {
         name: fileName,
         width: size.width,
         height: size.height,
         originalWidth: image.naturalWidth,
         originalHeight: image.naturalHeight,
-      });
+      };
+      setImageMeta(meta);
+
+      try {
+        window.sessionStorage.removeItem(SESSION_META_KEY);
+        window.sessionStorage.removeItem(SESSION_IMAGE_KEY);
+        window.sessionStorage.removeItem(SESSION_MASK_KEY);
+        window.sessionStorage.removeItem(SESSION_RESULT_KEY);
+
+        // WebP keeps the temporary browser session compact enough for most 4 MB uploads.
+        const originalData = original.toDataURL("image/webp", 0.82);
+        const imageSaved = safeSessionSet(SESSION_IMAGE_KEY, originalData);
+        const maskSaved = safeSessionSet(SESSION_MASK_KEY, mask.toDataURL("image/png"));
+        const sessionMeta: SessionMeta = {
+          version: 2,
+          image: meta,
+          brushSize,
+          radius,
+          mode,
+          algorithm,
+          hasResult: false,
+          updatedAt: Date.now(),
+        };
+        const metaSaved = safeSessionSet(SESSION_META_KEY, JSON.stringify(sessionMeta));
+        setSessionStatus(
+          imageSaved && maskSaved && metaSaved
+            ? "Ảnh đã lưu tạm trong phiên trình duyệt"
+            : "Ảnh đang xử lý local; bộ nhớ phiên không đủ để lưu khi refresh"
+        );
+      } catch {
+        setSessionStatus("Ảnh đang xử lý local; không thể lưu phiên trên trình duyệt này");
+      }
+
       setMessage(
         size.width !== image.naturalWidth || size.height !== image.naturalHeight
-          ? `Ảnh được thu về ${size.width}×${size.height}px để tránh tràn bộ nhớ trình duyệt.`
-          : "Hãy tô vùng cần phục hồi bằng brush."
+          ? `Ảnh được thu về ${size.width}×${size.height}px để xử lý ổn định và lưu phiên.`
+          : "Ảnh đã tải. Hãy tô vùng cần phục hồi bằng brush."
       );
 
-      requestAnimationFrame(refreshDisplay);
+      await nextFrame();
+      refreshDisplay();
     },
-    [refreshDisplay]
+    [algorithm, brushSize, mode, radius, refreshDisplay, safeSessionSet]
   );
 
   const loadFile = useCallback(
@@ -174,19 +280,23 @@ export default function ImageCleaner() {
         return;
       }
       if (file.size > MAX_FILE_MB * 1024 * 1024) {
-        setMessage(`Ảnh vượt quá ${MAX_FILE_MB} MB.`);
+        setMessage(`Ảnh vượt quá ${MAX_FILE_MB} MB. Vui lòng chọn file nhỏ hơn.`);
         return;
       }
 
+      setMessage("Đang đọc ảnh...");
       const objectUrl = URL.createObjectURL(file);
       const image = new Image();
-      image.onload = () => {
-        initializeCanvas(image, file.name);
-        URL.revokeObjectURL(objectUrl);
+      image.onload = async () => {
+        try {
+          await initializeCanvas(image, file.name);
+        } finally {
+          URL.revokeObjectURL(objectUrl);
+        }
       };
       image.onerror = () => {
         URL.revokeObjectURL(objectUrl);
-        setMessage("Không đọc được ảnh này.");
+        setMessage("Không đọc được ảnh này. Hãy thử PNG, JPEG hoặc WebP khác.");
       };
       image.src = objectUrl;
     },
@@ -229,9 +339,7 @@ export default function ImageCleaner() {
     const width = Math.max(1, brushSize * scale);
 
     maskCtx.save();
-    if (mode === "erase") {
-      maskCtx.globalCompositeOperation = "destination-out";
-    }
+    if (mode === "erase") maskCtx.globalCompositeOperation = "destination-out";
     maskCtx.strokeStyle = "white";
     maskCtx.fillStyle = "white";
     maskCtx.lineWidth = width;
@@ -273,8 +381,13 @@ export default function ImageCleaner() {
     if (drawingRef.current && event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
+    const didDraw = drawingRef.current;
     drawingRef.current = false;
     lastPointRef.current = null;
+    if (didDraw) {
+      persistMask();
+      saveMeta();
+    }
   }
 
   function undo() {
@@ -285,6 +398,7 @@ export default function ImageCleaner() {
     ctx.putImageData(previous, 0, 0);
     setHistoryCount(historyRef.current.length);
     refreshDisplay();
+    persistMask();
   }
 
   function clearMask() {
@@ -294,6 +408,8 @@ export default function ImageCleaner() {
     pushHistory();
     ctx.clearRect(0, 0, mask.width, mask.height);
     refreshDisplay();
+    persistMask();
+    setMessage("Đã xóa mask.");
   }
 
   function hasSelectedPixels() {
@@ -301,7 +417,7 @@ export default function ImageCleaner() {
     const ctx = mask?.getContext("2d");
     if (!mask || !ctx) return false;
     const pixels = ctx.getImageData(0, 0, mask.width, mask.height).data;
-    for (let i = 0; i < pixels.length; i += 4) {
+    for (let i = 3; i < pixels.length; i += 4) {
       if (pixels[i] > 10) return true;
     }
     return false;
@@ -314,73 +430,84 @@ export default function ImageCleaner() {
       return;
     }
 
-    const cvValue = window.cv;
-    if (!cvValue) {
-      setMessage("OpenCV.js chưa sẵn sàng.");
+    const original = originalCanvasRef.current;
+    const mask = maskCanvasRef.current;
+    const result = resultCanvasRef.current;
+    if (!original || !mask || !result) {
+      setMessage("Canvas chưa sẵn sàng. Hãy thử chọn ảnh lại.");
       return;
     }
 
+    const originalCtx = original.getContext("2d", { willReadFrequently: true });
+    const maskCtx = mask.getContext("2d", { willReadFrequently: true });
+    const resultCtx = result.getContext("2d");
+    if (!originalCtx || !maskCtx || !resultCtx) return;
+
+    workerRef.current?.terminate();
+    const worker = new Worker("/inpaint-worker.js");
+    workerRef.current = worker;
     setProcessing(true);
-    setMessage("Đang inpaint trực tiếp trên thiết bị...");
+    setMessage("Đang xử lý 0% — toàn bộ diễn ra trong trình duyệt...");
 
-    // Cho React một frame để render trạng thái trước khi tác vụ CPU nặng bắt đầu.
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    await nextFrame();
 
-    let srcRgba: any;
-    let srcRgb: any;
-    let maskRgba: any;
-    let maskGray: any;
-    let binaryMask: any;
-    let dstRgb: any;
-    let dstRgba: any;
+    const sourceData = originalCtx.getImageData(0, 0, original.width, original.height);
+    const maskData = maskCtx.getImageData(0, 0, mask.width, mask.height);
 
-    try {
-      const cv = cvValue instanceof Promise ? await cvValue : cvValue;
-      const original = originalCanvasRef.current;
-      const mask = maskCanvasRef.current;
-      const result = resultCanvasRef.current;
-      if (!original || !mask || !result) throw new Error("Canvas chưa sẵn sàng");
+    worker.onmessage = (event: MessageEvent) => {
+      const data = event.data as
+        | { type: "progress"; progress: number }
+        | { type: "done"; resultBuffer: ArrayBuffer }
+        | { type: "error"; message: string };
 
-      if (typeof cv.inpaint !== "function") {
-        throw new Error("Bản OpenCV.js hiện tại không có module photo/inpaint.");
+      if (data.type === "progress") {
+        setMessage(`Đang xử lý ${Math.max(0, Math.min(100, data.progress))}% — dữ liệu không rời khỏi trình duyệt.`);
+        return;
       }
 
-      srcRgba = cv.imread(original);
-      srcRgb = new cv.Mat();
-      cv.cvtColor(srcRgba, srcRgb, cv.COLOR_RGBA2RGB);
+      if (data.type === "error") {
+        setProcessing(false);
+        setMessage(`Xử lý thất bại: ${data.message}`);
+        worker.terminate();
+        if (workerRef.current === worker) workerRef.current = null;
+        return;
+      }
 
-      maskRgba = cv.imread(mask);
-      maskGray = new cv.Mat();
-      binaryMask = new cv.Mat();
-      cv.cvtColor(maskRgba, maskGray, cv.COLOR_RGBA2GRAY);
-      cv.threshold(maskGray, binaryMask, 10, 255, cv.THRESH_BINARY);
-
-      dstRgb = new cv.Mat();
-      const flag = algorithm === "telea" ? cv.INPAINT_TELEA : cv.INPAINT_NS;
-      cv.inpaint(srcRgb, binaryMask, dstRgb, radius, flag);
-
-      dstRgba = new cv.Mat();
-      cv.cvtColor(dstRgb, dstRgba, cv.COLOR_RGB2RGBA);
       result.width = original.width;
       result.height = original.height;
-      cv.imshow(result, dstRgba);
-
+      const output = new Uint8ClampedArray(data.resultBuffer);
+      resultCtx.putImageData(new ImageData(output, original.width, original.height), 0, 0);
       setHasResult(true);
-      setMessage("Xử lý xong. Có thể tải ảnh PNG ở bên dưới.");
-    } catch (error) {
-      console.error(error);
-      const reason = error instanceof Error ? error.message : String(error);
-      setMessage(`Xử lý thất bại: ${reason}`);
-    } finally {
-      srcRgba?.delete?.();
-      srcRgb?.delete?.();
-      maskRgba?.delete?.();
-      maskGray?.delete?.();
-      binaryMask?.delete?.();
-      dstRgb?.delete?.();
-      dstRgba?.delete?.();
       setProcessing(false);
-    }
+      setMessage("Xử lý xong. Kết quả được tạo hoàn toàn trên thiết bị của bạn.");
+      worker.terminate();
+      if (workerRef.current === worker) workerRef.current = null;
+
+      requestAnimationFrame(() => {
+        persistResult();
+        saveMeta({ hasResult: true });
+      });
+    };
+
+    worker.onerror = (event) => {
+      console.error(event);
+      setProcessing(false);
+      setMessage("Worker xử lý ảnh gặp lỗi. Hãy thử ảnh nhỏ hơn hoặc refresh trang.");
+      worker.terminate();
+      if (workerRef.current === worker) workerRef.current = null;
+    };
+
+    worker.postMessage(
+      {
+        width: original.width,
+        height: original.height,
+        srcBuffer: sourceData.data.buffer,
+        maskBuffer: maskData.data.buffer,
+        radius,
+        algorithm,
+      },
+      [sourceData.data.buffer, maskData.data.buffer]
+    );
   }
 
   function downloadResult() {
@@ -400,16 +527,141 @@ export default function ImageCleaner() {
     }, "image/png");
   }
 
+  const clearSession = useCallback(() => {
+    workerRef.current?.terminate();
+    workerRef.current = null;
+    try {
+      window.sessionStorage.removeItem(SESSION_META_KEY);
+      window.sessionStorage.removeItem(SESSION_IMAGE_KEY);
+      window.sessionStorage.removeItem(SESSION_MASK_KEY);
+      window.sessionStorage.removeItem(SESSION_RESULT_KEY);
+    } catch {
+      // Ignore browsers that disable storage.
+    }
+
+    [originalCanvasRef, maskCanvasRef, overlayCanvasRef].forEach((ref) => {
+      const canvas = ref.current;
+      if (canvas) {
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+    });
+    const result = resultCanvasRef.current;
+    if (result) {
+      result.width = 0;
+      result.height = 0;
+    }
+
+    historyRef.current = [];
+    setHistoryCount(0);
+    setImageMeta(null);
+    setHasResult(false);
+    setProcessing(false);
+    setMessage("Phiên đã được xóa. Chọn ảnh mới để bắt đầu.");
+    setSessionStatus("Phiên cục bộ chưa có dữ liệu");
+  }, []);
+
   useEffect(() => {
     const savedTheme = window.localStorage.getItem("image-cleaner-theme");
     const initialTheme: Theme = savedTheme === "light" || savedTheme === "dark" ? savedTheme : "dark";
     setTheme(initialTheme);
     document.documentElement.dataset.theme = initialTheme;
 
+    let cancelled = false;
+
+    async function restoreSession() {
+      try {
+        const rawMeta = window.sessionStorage.getItem(SESSION_META_KEY);
+        const imageDataUrl = window.sessionStorage.getItem(SESSION_IMAGE_KEY);
+        if (!rawMeta || !imageDataUrl) return;
+
+        const saved = JSON.parse(rawMeta) as SessionMeta;
+        if (saved.version !== 2 || !saved.image) return;
+
+        setSessionStatus("Đang khôi phục phiên trình duyệt...");
+        const image = await loadImageSource(imageDataUrl);
+        if (cancelled) return;
+
+        const original = originalCanvasRef.current;
+        const mask = maskCanvasRef.current;
+        if (!original || !mask) return;
+
+        original.width = saved.image.width;
+        original.height = saved.image.height;
+        mask.width = saved.image.width;
+        mask.height = saved.image.height;
+
+        const originalCtx = original.getContext("2d", { willReadFrequently: true });
+        const maskCtx = mask.getContext("2d", { willReadFrequently: true });
+        if (!originalCtx || !maskCtx) return;
+        originalCtx.drawImage(image, 0, 0, saved.image.width, saved.image.height);
+        maskCtx.clearRect(0, 0, mask.width, mask.height);
+
+        const maskDataUrl = window.sessionStorage.getItem(SESSION_MASK_KEY);
+        if (maskDataUrl) {
+          try {
+            const maskImage = await loadImageSource(maskDataUrl);
+            if (!cancelled) maskCtx.drawImage(maskImage, 0, 0, mask.width, mask.height);
+          } catch {
+            // A missing/corrupt mask should not prevent restoring the image.
+          }
+        }
+
+        setBrushSize(saved.brushSize || 42);
+        setRadius(saved.radius || 3);
+        setMode(saved.mode === "erase" ? "erase" : "paint");
+        setAlgorithm(saved.algorithm === "ns" ? "ns" : "telea");
+        setImageMeta(saved.image);
+        setHasResult(Boolean(saved.hasResult));
+        setMessage("Đã khôi phục ảnh và mask từ phiên của tab này.");
+        setSessionStatus("Đã khôi phục phiên cục bộ");
+
+        await nextFrame();
+        await nextFrame();
+        if (cancelled) return;
+        refreshDisplay();
+
+        const resultDataUrl = window.sessionStorage.getItem(SESSION_RESULT_KEY);
+        const result = resultCanvasRef.current;
+        if (saved.hasResult && resultDataUrl && result) {
+          try {
+            const resultImage = await loadImageSource(resultDataUrl);
+            if (cancelled) return;
+            result.width = saved.image.width;
+            result.height = saved.image.height;
+            const resultCtx = result.getContext("2d");
+            resultCtx?.drawImage(resultImage, 0, 0, result.width, result.height);
+          } catch {
+            setHasResult(false);
+          }
+        } else if (saved.hasResult) {
+          setHasResult(false);
+        }
+      } catch (error) {
+        console.warn("Không thể khôi phục phiên:", error);
+        setSessionStatus("Không thể khôi phục phiên cũ");
+      }
+    }
+
+    restoreSession();
+
     return () => {
+      cancelled = true;
+      workerRef.current?.terminate();
+      workerRef.current = null;
       historyRef.current = [];
     };
-  }, []);
+  }, [refreshDisplay]);
+
+  useEffect(() => {
+    if (!imageMeta) return;
+    requestAnimationFrame(refreshDisplay);
+  }, [imageMeta, refreshDisplay]);
+
+  useEffect(() => {
+    if (!imageMeta) return;
+    saveMeta();
+  }, [algorithm, brushSize, imageMeta, mode, radius, saveMeta]);
 
   function changeTheme(nextTheme: Theme) {
     setTheme(nextTheme);
@@ -419,36 +671,16 @@ export default function ImageCleaner() {
 
   return (
     <main className="shell">
-      <Script
-        id="opencv-js"
-        src={OPENCV_URL}
-        strategy="afterInteractive"
-        onLoad={async () => {
-          try {
-            const raw = window.cv;
-            if (!raw) throw new Error("cv chưa được tạo");
-            const cv = raw instanceof Promise ? await raw : raw;
-            window.cv = cv;
-            setCvReady(true);
-            setCvError(false);
-          } catch (error) {
-            console.error(error);
-            setCvError(true);
-          }
-        }}
-        onError={() => setCvError(true)}
-      />
-
       <section className="hero">
         <div className="heroCopy">
           <div className="brandLine">
             <img className="brandLogo" src="/logo.svg" alt="" width="64" height="64" />
-            <span className="eyebrow">NEXT.JS 15 · OPENCV.JS · CLIENT-SIDE</span>
+            <span className="eyebrow">NEXT.JS 15 · LOCAL WORKER · CLIENT-SIDE</span>
           </div>
           <h1>Image Cleaner</h1>
           <p>
-            Tô vùng cần chỉnh sửa rồi dùng inpainting để tái tạo từ các pixel lân cận. Ảnh được xử lý
-            trong trình duyệt, không gửi lên API.
+            Tô vùng cần chỉnh sửa rồi phục hồi từ các pixel lân cận. Ảnh được xử lý ngay trong trình duyệt,
+            không upload lên API hay máy chủ xử lý ảnh.
           </p>
         </div>
         <div className="heroActions">
@@ -470,7 +702,7 @@ export default function ImageCleaner() {
               ◐ Tối
             </button>
           </div>
-          <div className={`status ${cvReady ? "ok" : cvError ? "bad" : "loading"}`}>
+          <div className={`status ${processing ? "loading" : "ok"}`}>
             <span className="dot" /> {statusText}
           </div>
         </div>
@@ -501,6 +733,16 @@ export default function ImageCleaner() {
           />
           <strong>{imageMeta ? "Đổi ảnh" : "Chọn hoặc kéo ảnh vào đây"}</strong>
           <span>PNG · JPEG · WebP · tối đa {MAX_FILE_MB} MB</span>
+        </div>
+
+        <div className="sessionBar">
+          <div>
+            <strong>Phiên xử lý trên trình duyệt</strong>
+            <span>{sessionStatus}. Refresh trong cùng tab sẽ tự khôi phục khi bộ nhớ cho phép.</span>
+          </div>
+          <button type="button" className="secondary sessionClear" onClick={clearSession} disabled={!imageMeta}>
+            Xóa phiên
+          </button>
         </div>
 
         {imageMeta && (
@@ -536,16 +778,16 @@ export default function ImageCleaner() {
                 </div>
 
                 <div className="controlGroup">
-                  <label htmlFor="radius">Inpaint radius <b>{radius}px</b></label>
-                  <input id="radius" type="range" min="1" max="12" value={radius} onChange={(e) => setRadius(Number(e.target.value))} />
-                  <small>3–5px thường tốt cho vùng nhỏ.</small>
+                  <label htmlFor="radius">Bán kính lấy mẫu <b>{radius}px</b></label>
+                  <input id="radius" type="range" min="1" max="10" value={radius} onChange={(e) => setRadius(Number(e.target.value))} />
+                  <small>3–5px thường phù hợp với watermark/vùng nhỏ.</small>
                 </div>
 
                 <div className="controlGroup">
-                  <label>Thuật toán</label>
+                  <label>Chế độ phục hồi</label>
                   <select value={algorithm} onChange={(e) => setAlgorithm(e.target.value as Algorithm)}>
-                    <option value="telea">Telea — nhanh, mặc định</option>
-                    <option value="ns">Navier–Stokes — thử với đường nét</option>
+                    <option value="telea">Nhanh — ưu tiên pixel gần</option>
+                    <option value="ns">Mượt — thêm làm mịn vùng phục hồi</option>
                   </select>
                 </div>
 
@@ -606,10 +848,11 @@ export default function ImageCleaner() {
       )}
 
       <section className="notes">
-        <h3>Lưu ý</h3>
+        <h3>Riêng tư & phiên xử lý</h3>
         <p>
-          Inpainting cổ điển phù hợp với vùng nhỏ trên nền tương đối đều. Với vùng lớn hoặc nội dung phức tạp,
-          kết quả có thể bị nhòe vì phiên bản này không dùng generative AI. Chỉ dùng với ảnh mà bạn có quyền chỉnh sửa.
+          Ảnh và mask được xử lý bằng Web Worker ngay trên thiết bị. Không có API xử lý ảnh. Dữ liệu phiên được lưu tạm
+          bằng sessionStorage để có thể refresh trong cùng tab; bạn có thể bấm “Xóa phiên” bất kỳ lúc nào. Inpainting local
+          phù hợp nhất với vùng nhỏ trên nền tương đối đều. Chỉ dùng với ảnh mà bạn có quyền chỉnh sửa.
         </p>
       </section>
     </main>
