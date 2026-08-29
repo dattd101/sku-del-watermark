@@ -74,3 +74,19 @@ Nếu project Vercel cũ đã từng đặt **Output Directory = public**, vào:
 - Root Directory: để trống nếu `package.json` nằm ở root repository
 
 Sau đó Redeploy.
+
+
+## Giao diện
+
+- Có nút chọn **Sáng / Tối** ngay trên đầu trang.
+- Lựa chọn được lưu trong `localStorage`.
+- Giới hạn file upload: **4 MB**.
+
+## Branding & Google Analytics
+
+- Logo: `public/logo.svg`
+- Favicon SVG: `app/icon.svg`
+- Favicon ICO: `app/favicon.ico`
+- Apple icon: `app/apple-icon.png`
+- Google Analytics Measurement ID: `G-8FMGRVQZY5`
+- Google tag được nạp bằng `next/script` trong `app/layout.tsx` với `strategy="afterInteractive"`.

@@ -15,6 +15,7 @@ import {
 type Point = { x: number; y: number };
 type ToolMode = "paint" | "erase";
 type Algorithm = "telea" | "ns";
+type Theme = "dark" | "light";
 
 type ImageMeta = {
   name: string;
@@ -26,7 +27,7 @@ type ImageMeta = {
 
 const OPENCV_URL = "https://docs.opencv.org/4.13.0/opencv.js";
 const MAX_DIMENSION = 4096;
-const MAX_FILE_MB = 25;
+const MAX_FILE_MB = 4;
 const HISTORY_LIMIT = 12;
 
 function fitInside(width: number, height: number, maxDimension: number) {
@@ -63,6 +64,7 @@ export default function ImageCleaner() {
   const [message, setMessage] = useState("Chưa chọn ảnh");
   const [isDragging, setIsDragging] = useState(false);
   const [historyCount, setHistoryCount] = useState(0);
+  const [theme, setTheme] = useState<Theme>("dark");
 
   const canProcess = Boolean(cvReady && imageMeta && !processing);
 
@@ -399,10 +401,21 @@ export default function ImageCleaner() {
   }
 
   useEffect(() => {
+    const savedTheme = window.localStorage.getItem("image-cleaner-theme");
+    const initialTheme: Theme = savedTheme === "light" || savedTheme === "dark" ? savedTheme : "dark";
+    setTheme(initialTheme);
+    document.documentElement.dataset.theme = initialTheme;
+
     return () => {
       historyRef.current = [];
     };
   }, []);
+
+  function changeTheme(nextTheme: Theme) {
+    setTheme(nextTheme);
+    document.documentElement.dataset.theme = nextTheme;
+    window.localStorage.setItem("image-cleaner-theme", nextTheme);
+  }
 
   return (
     <main className="shell">
@@ -427,16 +440,39 @@ export default function ImageCleaner() {
       />
 
       <section className="hero">
-        <div>
-          <span className="eyebrow">NEXT.JS 15 · OPENCV.JS · CLIENT-SIDE</span>
+        <div className="heroCopy">
+          <div className="brandLine">
+            <img className="brandLogo" src="/logo.svg" alt="" width="64" height="64" />
+            <span className="eyebrow">NEXT.JS 15 · OPENCV.JS · CLIENT-SIDE</span>
+          </div>
           <h1>Image Cleaner</h1>
           <p>
             Tô vùng cần chỉnh sửa rồi dùng inpainting để tái tạo từ các pixel lân cận. Ảnh được xử lý
             trong trình duyệt, không gửi lên API.
           </p>
         </div>
-        <div className={`status ${cvReady ? "ok" : cvError ? "bad" : "loading"}`}>
-          <span className="dot" /> {statusText}
+        <div className="heroActions">
+          <div className="themePicker" role="group" aria-label="Chọn giao diện sáng hoặc tối">
+            <button
+              type="button"
+              className={theme === "light" ? "active" : ""}
+              onClick={() => changeTheme("light")}
+              aria-pressed={theme === "light"}
+            >
+              ☀ Sáng
+            </button>
+            <button
+              type="button"
+              className={theme === "dark" ? "active" : ""}
+              onClick={() => changeTheme("dark")}
+              aria-pressed={theme === "dark"}
+            >
+              ◐ Tối
+            </button>
+          </div>
+          <div className={`status ${cvReady ? "ok" : cvError ? "bad" : "loading"}`}>
+            <span className="dot" /> {statusText}
+          </div>
         </div>
       </section>
 
