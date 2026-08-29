@@ -58,3 +58,19 @@ const OPENCV_URL = "/vendor/opencv.js";
 ## License
 
 Phần source code mẫu trong project này có thể tùy chỉnh cho dự án của bạn. OpenCV có license riêng của dự án OpenCV.
+
+
+## Deploy lên Vercel
+
+Project có `vercel.json` để ép Vercel nhận đúng Next.js và output `.next`.
+
+Nếu project Vercel cũ đã từng đặt **Output Directory = public**, vào:
+
+**Settings → Build and Deployment → Framework Settings**
+
+- Framework Preset: `Next.js`
+- Build Command: để mặc định hoặc `npm run build`
+- Output Directory: tắt **Override** (khuyến nghị)
+- Root Directory: để trống nếu `package.json` nằm ở root repository
+
+Sau đó Redeploy.
